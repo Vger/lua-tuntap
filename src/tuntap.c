@@ -30,10 +30,12 @@ static int meth_gethwaddr(lua_State *L);
 static int meth_receive(lua_State *L);
 static int meth_send(lua_State *L);
 static int meth_close(lua_State *L);
+static int meth_settimeout(lua_State *L);
 
 struct utun {
     int fd;
     unsigned char hwaddr[6];
+    lua_Number timeout;
 };
 
 static luaL_Reg func[] = {
@@ -48,6 +50,7 @@ static luaL_Reg meth[] = {
     {"receive", meth_receive},
     {"send", meth_send},
     {"close", meth_close},
+    {"settimeout", meth_settimeout},
     {NULL, NULL}
 };
 
@@ -57,7 +60,7 @@ static int init_iface(lua_State *L)
     struct ifreq ifr;
     char tun_name[MAXPATHLEN+1];
     bool tap;
-    struct utun template = {-1, {0}};
+    struct utun template = {-1, {0}, -1};
     int sock = -1;
     int rc = 0;
     struct utun *obj = NULL;
@@ -207,6 +210,13 @@ static int meth_receive(lua_State *L)
     size_t target = sizeof(buffer);
     ssize_t readlen;
 
+    if(obj->fd < 0)
+    {
+	lua_pushnil(L);
+	lua_pushliteral(L, "closed");
+	return 2;
+    }
+
     if(lua_isnumber(L, 2))
     {
 	lua_Number sizespec = lua_tonumber(L, 2);
@@ -215,6 +225,26 @@ static int meth_receive(lua_State *L)
 	target = (size_t) sizespec;
     }
     target = MIN(target, sizeof buffer);
+
+    if(obj->timeout >= 0.0)
+    {
+	fd_set set;
+	struct timeval timeout;
+
+	FD_ZERO(&set);
+	FD_SET(obj->fd, &set);
+
+	timeout.tv_sec = (int) obj->timeout;
+	timeout.tv_usec = (int)((obj->timeout - timeout.tv_sec) * 1.0e6);
+
+	if(select(obj->fd + 1, &set, NULL, NULL, &timeout) != 1)
+	{
+	    lua_pushnil(L);
+	    lua_pushliteral(L, "timeout");
+	    return 2;
+	}
+    }
+
     readlen = read(obj->fd, buffer, target);
     if (readlen < 0)
     {
@@ -243,6 +273,13 @@ static int meth_send(lua_State *L)
     const char *data = luaL_checklstring(L, 2, &count);
     ssize_t rc;
 
+    if(obj->fd < 0)
+    {
+	lua_pushnil(L);
+	lua_pushliteral(L, "closed");
+	return 2;
+    }
+
     rc = write(obj->fd, data, count);
     if (rc >= 0)
     {
@@ -250,6 +287,15 @@ static int meth_send(lua_State *L)
 	return 1;
     }
     lua_pushnil(L);
+    return 1;
+}
+
+static int meth_settimeout(lua_State *L)
+{
+    struct utun *obj = luaL_checkudata(L, 1, TUN_METATABLE);
+    lua_Number t = luaL_optnumber(L, 2, -1);
+    obj->timeout = t;
+    lua_pushnumber(L, 1);
     return 1;
 }
 
