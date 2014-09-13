@@ -1,18 +1,35 @@
+#ifdef __linux__
+#define _GNU_SOURCE           /* For memrchr in string.h */
+#endif
+
 #include "lua.h"
 #include "lauxlib.h"
 #include "tuntap.h"
 
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+#include <sys/param.h>	      /* MAXPATHLEN, BSD */
+#endif
+
 #include <stdbool.h>
-#include <string.h>     /* For strncpy */
-#include <fcntl.h>      /* For open */
-#include <unistd.h>     /* For close */
-#include <libgen.h>     /* For basename_r */
-#include <sys/ioctl.h>  /* For ioctl */
-#include <net/if.h>     /* IFF_UP / struct ifreq */
-#include <net/if_tun.h> /* TUNSIFHEAD */
-#include <sys/param.h>  /* MAXPATHLEN */
-#include <net/if_dl.h>  /* struct sockaddr_dl */
-#include <ifaddrs.h>    /* getifaddrs */
+#include <string.h>           /* For strncpy, memset, memrchr */
+#include <ctype.h>	      /* isdigit */
+#include <fcntl.h>            /* For open */
+#include <unistd.h>           /* For close */
+#include <sys/ioctl.h>        /* For ioctl */
+#include <net/if.h>           /* IFF_UP / struct ifreq */
+
+#ifdef BSD
+#include <net/if_tun.h>       /* TUNSIFHEAD */
+#include <net/if_dl.h>        /* struct sockaddr_dl */
+#endif
+
+#ifdef __linux__
+#include <errno.h>
+#include <linux/if_tun.h>
+#include <netpacket/packet.h> /* struct sockaddr_ll */
+#endif
+
+#include <ifaddrs.h>          /* getifaddrs */
 
 /* Maximum size of a single buffer for tunnel interface */
 #define IFACE_BUFSIZE 65535
@@ -31,11 +48,12 @@ static int meth_receive(lua_State *L);
 static int meth_send(lua_State *L);
 static int meth_close(lua_State *L);
 static int meth_settimeout(lua_State *L);
+static int meth_up(lua_State *L);
 
 struct utun {
     int fd;
-    unsigned char hwaddr[6];
     lua_Number timeout;
+    char name[IFNAMSIZ];
 };
 
 static luaL_Reg func[] = {
@@ -47,6 +65,7 @@ static luaL_Reg meth[] = {
     {"dirty", meth_dirty},
     {"getfd", meth_getfd},
     {"gethwaddr", meth_gethwaddr},
+    {"up", meth_up},
     {"receive", meth_receive},
     {"send", meth_send},
     {"close", meth_close},
@@ -56,19 +75,31 @@ static luaL_Reg meth[] = {
 
 static int init_iface(lua_State *L)
 {
-    const char *iface_path = luaL_checkstring(L, 1);
+    const char *device_path;
+    size_t device_path_len;
+    const char *basename;
     struct ifreq ifr;
-    char tun_name[MAXPATHLEN+1];
     bool tap;
-    struct utun template = {-1, {0}, -1};
-    int sock = -1;
-    int rc = 0;
     struct utun *obj = NULL;
+    int i;
 
-    basename_r(iface_path, tun_name);
-    if (tun_name[0] == 't' && tun_name[1] == 'u' && tun_name[2] == 'n')
+    luaL_checktype(L, 1, LUA_TSTRING);
+
+    device_path = lua_tolstring(L, 1, &device_path_len);
+    if (device_path == NULL)
+    {
+	lua_pushliteral(L, "Internal error: lua_tolstring returns NULL");
+	return lua_error(L);
+    }
+    basename = memrchr(device_path, '/', device_path_len);
+    if (basename == NULL)
+	basename = device_path;
+    else
+	basename++;
+
+    if (basename[0] == 't' && basename[1] == 'u' && basename[2] == 'n')
 	tap = false;
-    else if (tun_name[0] == 't' && tun_name[1] == 'a' && tun_name[2] == 'p')
+    else if (basename[0] == 't' && basename[1] == 'a' && basename[2] == 'p')
 	tap = true;
     else
     {
@@ -76,28 +107,194 @@ static int init_iface(lua_State *L)
 	lua_pushliteral(L, "Neither a TUN nor TAP device specified");
 	return 2;
     }
-
-    template.fd = open(iface_path, O_RDWR);
-    if (template.fd < 0)
+    for (i = 3; basename[i] != '\0'; i++)
+    {
+	if (!isdigit(basename[i]))
+	{
+	    lua_pushnil(L);
+	    lua_pushfstring(L, "The name \"%s\" is invalid.", basename);
+	    return 2;
+	}
+    }
+    if (i+1 > sizeof obj->name)
     {
 	lua_pushnil(L);
-	lua_pushfstring(L, "Could not open device \"%s\"", iface_path);
+	lua_pushliteral(L, "The interface name is too long.");
 	return 2;
     }
 
+    obj = (struct utun *) lua_newuserdata(L, sizeof(struct utun));
+    obj->fd = -1;
+    obj->timeout = -1;
+
+    memset(&ifr, 0, sizeof ifr);
+
+#ifdef __linux__
+    obj->fd = open("/dev/net/tun", O_RDWR);
+    if (obj->fd < 0)
+    {
+	lua_pop(L, 1);
+	lua_pushnil(L);
+	lua_pushliteral(L, "Could not open clone device \"/dev/net/tun\"");
+	return 2;
+    }
+
+    ifr.ifr_flags = tap ? IFF_TAP : IFF_TUN;
+    ifr.ifr_flags |= IFF_NO_PI;
+
+    if (basename[3] != '\0')
+	strncpy(ifr.ifr_name, basename, sizeof(ifr.ifr_name));
+
+    if (ioctl(obj->fd, TUNSETIFF, &ifr) < 0)
+    {
+	lua_pop(L, 1);
+	lua_pushnil(L);
+	lua_pushfstring(L, "Failed to configure %s tunnel: %s", basename, strerror(errno));
+	goto failed;
+    }
+
+    strncpy(obj->name, ifr.ifr_name, sizeof(obj->name));
+#endif /* __linux__ */
+
+#ifdef BSD
+    obj->fd = open(device_path, O_RDWR);
+    if (obj->fd < 0)
+    {
+	lua_pop(L, 1);
+	lua_pushnil(L);
+	lua_pushfstring(L, "Could not open device \"%s\"", device_path);
+	return 2;
+    }
+
+#if defined(TUNSIFHEAD) && defined(MULTIAF)
     if (!tap)
     {
 	/* Turn on tunnel headers */
 	int flag = 1;
-	if (ioctl(template.fd, TUNSIFHEAD, &flag) < 0)
+	if (ioctl(obj->fd, TUNSIFHEAD, &flag) < 0)
 	{
+	    lua_pop(L, 1);
 	    lua_pushnil(L);
 	    lua_pushliteral(L, "Initializing multi-af mode failed");
 	    goto failed;
 	}
     }
+#endif
 
-    strncpy(ifr.ifr_name, tun_name, sizeof(ifr.ifr_name));
+    strncpy(obj->name, basename, sizeof(obj->name));
+
+#endif /* BSD */
+
+    luaL_getmetatable(L, TUN_METATABLE);
+    lua_setmetatable(L, -2);
+
+    return 1;
+
+failed:
+    if (obj && obj->fd >= 0)
+	close(obj->fd);
+    return 2;
+}
+
+static int meth_dirty(lua_State *L)
+{
+    void *obj = luaL_checkudata(L, 1, TUN_METATABLE);
+    (void) obj;
+    lua_pushboolean(L, 0);
+    return 1;
+}
+
+static int meth_getfd(lua_State *L)
+{
+    struct utun *obj = luaL_checkudata(L, 1, TUN_METATABLE);
+    lua_pushnumber(L, obj->fd);
+    return 1;
+}
+
+/* Get hardware address of tap interface */
+static int meth_gethwaddr(lua_State *L)
+{
+    struct utun *obj = luaL_checkudata(L, 1, TUN_METATABLE);
+    struct ifaddrs *ifap = NULL;
+    struct ifaddrs *ifa = NULL;
+    unsigned char hwaddr[6];
+    bool found = false;
+    lua_Number v;
+
+    if (obj->fd < 0 || obj->name[0] != 't' || obj->name[1] != 'a' || obj->name[2] != 'p')
+    {
+	return 0;
+    }
+
+    if (getifaddrs(&ifap) < 0)
+    {
+	lua_pushnil(L);
+	lua_pushliteral(L, "Get interface information failed");
+	return 2;
+    }
+    for (ifa = ifap; ifa; ifa = ifa->ifa_next)
+    {
+#ifdef BSD
+	if (ifa->ifa_addr->sa_family == AF_LINK && strcmp(obj->name, ifa->ifa_name) == 0)
+	{
+	    struct sockaddr_dl *sdl = (struct sockaddr_dl *) ifa->ifa_addr;
+	    size_t copylen = sizeof hwaddr;
+	    if (sdl->sdl_alen < copylen)
+		copylen = sdl->sdl_alen;
+	    memcpy(hwaddr, LLADDR(sdl), copylen);
+	    found = true;
+	    break;
+	}
+#endif
+#ifdef __linux__
+	if (ifa->ifa_addr->sa_family == AF_PACKET && strcmp(obj->name, ifa->ifa_name) == 0)
+	{
+	    struct sockaddr_ll *sll = (struct sockaddr_ll *) ifa->ifa_addr;
+	    size_t copylen = sizeof hwaddr;
+	    if (sll->sll_halen < copylen)
+		copylen = sll->sll_halen;
+	    memcpy(hwaddr, sll->sll_addr, copylen);
+	    found = true;
+	    break;
+	}
+#endif
+    }
+    freeifaddrs(ifap);
+
+    if (!found)
+	return 0;
+
+    v = hwaddr[0];
+    v *= 256;
+    v += hwaddr[1];
+    v *= 256;
+    v += hwaddr[2];
+    v *= 256;
+    v += hwaddr[3];
+    v *= 256;
+    v += hwaddr[4];
+    v *= 256;
+    v += hwaddr[5];
+    lua_pushnumber(L, v);
+
+    return 1;
+}
+
+static int meth_up(lua_State *L)
+{
+    struct utun *obj = luaL_checkudata(L, 1, TUN_METATABLE);
+    struct ifreq ifr;
+    int sock = -1;
+
+    if (obj->fd < 0)
+    {
+	lua_pushnil(L);
+	lua_pushliteral(L, "Tunnel closed");
+         goto failed;
+    }
+    memset(&ifr, 0, sizeof ifr);
+
+    strncpy(ifr.ifr_name, obj->name, sizeof(ifr.ifr_name));
     sock = socket(PF_UNIX, SOCK_STREAM, 0);
     if (sock < 0)
     {
@@ -123,84 +320,15 @@ static int init_iface(lua_State *L)
 	}
     }
 
-    if (tap)
-    {
-	/* Get hardware address of tap interface */
-	struct ifaddrs *ifap = NULL;
-	struct ifaddrs *ifa = NULL;
-
-	if (getifaddrs(&ifap) < 0)
-	{
-	    lua_pushnil(L);
-	    lua_pushliteral(L, "Get interface information failed");
-	    goto failed;
-	}
-	for (ifa = ifap; ifa; ifa = ifa->ifa_next)
-	{
-	    if (ifa->ifa_addr->sa_family == AF_LINK && strcmp(tun_name, ifa->ifa_name) == 0)
-	    {
-		struct sockaddr_dl *sdl = (struct sockaddr_dl *) ifa->ifa_addr;
-		size_t copylen = sizeof template.hwaddr;
-		if (sdl->sdl_alen < copylen)
-		    copylen = sdl->sdl_alen;
-		memcpy(&(template.hwaddr), LLADDR(sdl), copylen);
-		break;
-	    }
-	}
-	freeifaddrs(ifap);
-    }
-
     close(sock);
-
-    obj = (struct utun *) lua_newuserdata(L, sizeof(struct utun));
-    memcpy(obj, &template, sizeof template);
-    luaL_getmetatable(L, TUN_METATABLE);
-    lua_setmetatable(L, -2);
-
+    lua_pushboolean(L, 1);
     return 1;
 
 failed:
-    rc = 2;
-    /* Fall-through to failed */
-
-    if (template.fd >= 0)
-	close(template.fd);
     if (sock >= 0)
 	close(sock);
-    return rc;
-}
 
-static int meth_dirty(lua_State *L)
-{
-    void *obj = luaL_checkudata(L, 1, TUN_METATABLE);
-    (void) obj;
-    lua_pushboolean(L, 0);
-    return 1;
-}
-
-static int meth_getfd(lua_State *L)
-{
-    struct utun *obj = luaL_checkudata(L, 1, TUN_METATABLE);
-    lua_pushnumber(L, obj->fd);
-    return 1;
-}
-
-static int meth_gethwaddr(lua_State *L)
-{
-    struct utun *obj = luaL_checkudata(L, 1, TUN_METATABLE);
-    lua_Number v = obj->hwaddr[0];
-    v *= 256;
-    v += obj->hwaddr[1];
-    v *= 256;
-    v += obj->hwaddr[2];
-    v *= 256;
-    v += obj->hwaddr[3];
-    v *= 256;
-    v += obj->hwaddr[4];
-    v *= 256;
-    v += obj->hwaddr[5];
-    lua_pushnumber(L, v);
-    return 1;
+    return 2;
 }
 
 static int meth_receive(lua_State *L)
@@ -210,14 +338,14 @@ static int meth_receive(lua_State *L)
     size_t target = sizeof(buffer);
     ssize_t readlen;
 
-    if(obj->fd < 0)
+    if (obj->fd < 0)
     {
 	lua_pushnil(L);
 	lua_pushliteral(L, "closed");
 	return 2;
     }
 
-    if(lua_isnumber(L, 2))
+    if (lua_isnumber(L, 2))
     {
 	lua_Number sizespec = lua_tonumber(L, 2);
 	if (sizespec < 0)
@@ -226,7 +354,7 @@ static int meth_receive(lua_State *L)
     }
     target = MIN(target, sizeof buffer);
 
-    if(obj->timeout >= 0.0)
+    if (obj->timeout >= 0.0)
     {
 	fd_set set;
 	struct timeval timeout;
@@ -237,7 +365,7 @@ static int meth_receive(lua_State *L)
 	timeout.tv_sec = (int) obj->timeout;
 	timeout.tv_usec = (int)((obj->timeout - timeout.tv_sec) * 1.0e6);
 
-	if(select(obj->fd + 1, &set, NULL, NULL, &timeout) != 1)
+	if (select(obj->fd + 1, &set, NULL, NULL, &timeout) != 1)
 	{
 	    lua_pushnil(L);
 	    lua_pushliteral(L, "timeout");
@@ -273,7 +401,7 @@ static int meth_send(lua_State *L)
     const char *data = luaL_checklstring(L, 2, &count);
     ssize_t rc;
 
-    if(obj->fd < 0)
+    if (obj->fd < 0)
     {
 	lua_pushnil(L);
 	lua_pushliteral(L, "closed");

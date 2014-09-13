@@ -3,7 +3,7 @@ lua-tuntap
 
 Access TUN/TAP interfaces from lua.
 Primarly developed for FreeBSD.
-Might add linux support later.
+Experimental linux support.
 
 Installation
 ============
